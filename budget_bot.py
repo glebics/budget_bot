@@ -7,8 +7,8 @@ from telegram import Update
 import schedule
 import time
 import threading
-from datetime import datetime, timedelta
-from dateutil import relativedelta
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения
@@ -101,7 +101,7 @@ def get_monthly_summary(year, month):
     conn = sqlite3.connect('budget.db')
     c = conn.cursor()
     start_date = f'{year}-{month:02d}-01'
-    end_date = (datetime.strptime(start_date, '%Y-%m-%d') + relativedelta.months(1)).strftime('%Y-%m-%d')
+    end_date = (datetime.strptime(start_date, '%Y-%m-%d') + relativedelta(months=1)).strftime('%Y-%m-%d')
     
     # Доходы
     c.execute('SELECT SUM(amount) FROM transactions WHERE type = ? AND date >= ? AND date < ?',
@@ -144,7 +144,7 @@ def handle_message(update: Update, context):
 # Обработка команды /summary
 def summary_command(update: Update, context):
     current_date = datetime.now()
-    prev_month = current_date - relativedelta.months(1)
+    prev_month = current_date - relativedelta(months=1)
     summary = get_monthly_summary(prev_month.year, prev_month.month)
     if summary:
         update.message.reply_text(summary)
@@ -166,7 +166,7 @@ def process_historical_messages(context):
 def schedule_monthly_summary(context):
     current_date = datetime.now()
     if current_date.day == 1:
-        prev_month = current_date - relativedelta.months(1)
+        prev_month = current_date - relativedelta(months=1)
         if not is_month_processed(prev_month.month, prev_month.year):
             summary = get_monthly_summary(prev_month.year, prev_month.month)
             if summary:
