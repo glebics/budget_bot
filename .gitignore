@@ -1,0 +1,6 @@
+.env
+budget.db
+__pycache__/
+*.pyc
+budget_logs.txt
+.DS_Store
