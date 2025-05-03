@@ -1,4 +1,3 @@
-# budget_bot_full.py  —  complete version with /daily command (~340 lines)
 # -----------------------------------------------------------------------------
 # 0. DEPENDENCIES --------------------------------------------------------------
 import os
@@ -20,16 +19,24 @@ if not TOKEN:
 DB_FILE = "budget.db"
 VALID_CATEGORIES = {c.strip().lower() for c in os.getenv("VALID_CATEGORIES", "").split(",") if c.strip()} or {"другое"}
 
+
 # 2. LOGGING -------------------------------------------------------------------
-logging.basicConfig(
-    filename="unparsed.log",
-    level=logging.INFO,
-    format="%(asctime)s | %(message)s",
-    encoding="utf-8",
-)
+log_unparsed = logging.getLogger("unparsed")
+log_unparsed.setLevel(logging.INFO)
+
+# создаём файловый хендлер только для нераспознанных
+handler = logging.FileHandler("unparsed.log", mode="w", encoding="utf-8")
+handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+log_unparsed.addHandler(handler)
+
+# Очищаем файл логов при каждом запуске
+with open("unparsed.log", "w", encoding="utf-8") as f:
+    f.write("")  # просто затираем
+
 
 # 3. TELEGRAM BOT --------------------------------------------------------------
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+
 
 # 4. DATABASE ------------------------------------------------------------------
 def init_db():
@@ -121,7 +128,7 @@ def parse_transaction(txt: str):
 
     d = _parse_date(_clean(lines[0]))
     if not d:
-        logging.info("NO_DATE_HEADER | %s", lines[0][:90])
+        log_unparsed.info("NO_DATE_HEADER | %s", lines[0][:90])
         return None, []
 
     res = []
@@ -157,16 +164,19 @@ def parse_transaction(txt: str):
                 is_primary = 1 if idx == 0 else 0     # ← для общего расхода
                 res.append(("expense", amt, cat, comment, is_primary))
             continue
+        # если строка не распознана — логируем отдельно
+        log_unparsed.info("UNPARSED | %s | %s", d.isoformat(), ln[:80])
 
-
-        # если строка не распознана — логируем для отладки
-        logging.info("UNPARSED | %s | %s", d.isoformat(), ln[:80])
+        # если НИ ОДНА строка не распарсилась — логируем заголовок
+        if not res:
+            with open("unparsed.log", "a", encoding="utf-8"):
+                flat = ' '.join(lines).replace('\n', ' ')
+                log_unparsed.info("%s | %s", d or "NO_DATE", flat[:120])
 
     return d, res
 
 
 # 6. REPORTS -------------------------------------------------------------------
-
 def _bounds(y,m):
     st=date(y,m,1); ey,em=(y+1,1) if m==12 else (y,m+1)
     return st, date(ey,em,1)
@@ -200,7 +210,6 @@ def get_summary(y: int, m: int):
     return inc, exp, cats
 
 
-
 def get_daily(y: int, m: int):
     st, en = _bounds(y, m)
     conn   = sqlite3.connect(DB_FILE)
@@ -223,12 +232,52 @@ def get_daily(y: int, m: int):
     return rows
 
 
+def pretty_money(v: float) -> str:
+    return f'{v:,.0f}р'.replace(',', ' ')        # узкий не‑перенос пробел
+
+
+def render_summary(month_name: str, y: int,
+                   inc: float, exp: float, bal: float,
+                   cats: list[tuple[str, float]]) -> str:
+    emoji = {'доход': '💰', 'расход': '💸', 'итог': '🟢' if bal >= 0 else '🔴'}
+    cat_emoji = {
+        'еда':'🍲', 'сладкое':'🍭', 'другое':'📦', 'нужное':'🛠️',
+        'жилье':'🏠', 'лекарства':'💊', 'проезд':'🚌', 'даня':'🧒',
+    }
+    lines = [
+        f"📊 <b>Отчёт за {month_name} {y}</b>",
+        f"{emoji['доход']} Доход:  <b>{pretty_money(inc)}</b>",
+        f"{emoji['расход']} Расход: <b>{pretty_money(exp)}</b>",
+        f"{emoji['итог']} Итог:   <b>{pretty_money(bal)}</b>",
+        '',
+        '📂 <b>Расходы по категориям</b>',
+    ]
+    for cat, val in cats:
+        ico = cat_emoji.get(cat, '•')
+        lines.append(f'{ico} {cat}: <b>{pretty_money(val)}</b>')
+    return '\n'.join(lines)
+
+
+def render_daily(rows):
+    out = ['🗓️ <b>Сводка по дням</b>']
+    for d, inc, exp in rows:
+        date_s = datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m')
+        bal    = inc - exp
+        out.append(f'{date_s}: +{inc:,.0f} / -{exp:,.0f} ⇒ {bal:,.0f}')
+    return '\n'.join(out)
+
+
 # 7. HANDLERS -----------------------------------------------------------------
+# сохраним id всех входящих msg и id ответов бота
+GC_BUFFER = []
+
+
 @bot.message_handler(commands=['start','help'])
 def _help(msg):
     bot.reply_to(msg,
         '<b>Фин‑бот</b>. Пересылай записи вида:\n<pre>7 апреля:\n-250р хлеб [еда]\n+50 000р зарплата</pre>'
         '\nФото с подписью тоже считаются. Отчёт: /summary 4, дневной: /daily 4.')
+
 
 @bot.message_handler(commands=['summary'])
 def _summary(msg):
@@ -237,21 +286,33 @@ def _summary(msg):
     except ValueError:
         bot.reply_to(msg, '/summary <месяц>'); return
 
-    # get_summary возвращает 3 значения — inc, exp, cats
-    inc, exp, cats = get_summary(datetime.now().year, mm)
+    y = datetime.now().year
+    inc, exp, cats = get_summary(y, mm)
     bal = inc - exp
 
     if not (inc or exp):
         bot.reply_to(msg, 'Нет данных'); return
 
+    # Показываем суммы по дням
+    daily_rows = get_daily(y, mm)
+    daily_text = render_daily(daily_rows)
+    daily_msg = bot.reply_to(msg, daily_text)
+
+    # Показываем итоговый отчёт
     name = [k for k, v in MONTHS_RU.items() if v == mm][0]
-    out  = [f'<b>Отчёт за {name} {datetime.now().year}</b>',
-            f'Доход:  <b>{inc:,.0f}</b>р',
-            f'Расход: <b>{exp:,.0f}</b>р',
-            f'Итог:   <b>{bal:,.0f}</b>р',
-            '<b>Расходы по категориям:</b>']
-    out += [f'{c}: <b>{a:,.0f}</b>р' for c, a in cats]
-    bot.reply_to(msg, '\n'.join(out))
+    summary_text = render_summary(name, y, inc, exp, bal, cats)
+    summary_msg = bot.reply_to(msg, summary_text)
+
+    # Удалим только команду /summary и временные сообщения о транзакциях
+    to_delete = GC_BUFFER.copy()
+    to_delete.append(msg.id)  # команду тоже удалить
+    for mid in to_delete:
+        try:
+            bot.delete_message(msg.chat.id, mid)
+        except:
+            pass  # может быть устарело
+    GC_BUFFER.clear()
+
 
 
 @bot.message_handler(commands=['daily'])
@@ -272,14 +333,20 @@ def _daily(msg):
         out.append(f'{d_fmt}: +{inc:,.0f}р / -{exp:,.0f}р ⇒ {bal:,.0f}р')
     bot.reply_to(msg, ''.join(out))
 
+
 @bot.message_handler(content_types=['text', 'photo'])
 def _incoming(msg):
     text = msg.text or msg.caption or ''
-    d, txs = parse_transaction(text)
-    if not txs:
+    d, rows = parse_transaction(text)
+    if not rows:
         return
-    add_transactions(d, txs)
-    bot.reply_to(msg, f'Записал {len(txs)} транзакций на {d.strftime("%d.%m.%Y")}')
+
+    add_transactions(d, rows)
+    bot_msg = bot.reply_to(msg, f'Записал {len(rows)} транзакций на {d.strftime("%d.%m.%Y")}')
+    
+    # Сохраняем и ID пользователя, и ID ответа бота
+    GC_BUFFER.extend([msg.id, bot_msg.id])
+
 
 # 8. MAIN LOOP ---------------------------------------------------------------
 if __name__ == '__main__':
