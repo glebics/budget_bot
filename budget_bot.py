@@ -32,34 +32,47 @@ logging.basicConfig(
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
 # 4. DATABASE ------------------------------------------------------------------
-
 def init_db():
+    """Создание / проверка таблицы с учётом поля primary_flag."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute(
-        """
+
+    # если таблицы нет — создаём сразу с нужными колонками
+    c.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            date     DATE    NOT NULL,
-            type     TEXT    CHECK(type IN ('income','expense')),
-            amount   INTEGER NOT NULL,   -- в копейках
-            category TEXT,
-            comment  TEXT
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            date         DATE    NOT NULL,
+            type         TEXT    CHECK(type IN ('income','expense')),
+            amount       INTEGER NOT NULL,   -- в копейках
+            category     TEXT,
+            comment      TEXT,
+            primary_flag INTEGER NOT NULL DEFAULT 1
         )
-        """
-    )
-    conn.commit(); conn.close()
+    """)
+
+    # если таблица уже была, убеждаемся, что колонка primary_flag есть
+    c.execute("PRAGMA table_info(transactions)")
+    cols = {row[1] for row in c.fetchall()}
+    if 'primary_flag' not in cols:
+        c.execute("ALTER TABLE transactions ADD COLUMN primary_flag INTEGER NOT NULL DEFAULT 1")
+
+    conn.commit()
+    conn.close()
 
 
 def add_transactions(d: date, rows: list[tuple]):
+    """rows: (type, amount, category, comment, primary_flag)"""
     if not rows:
         return
     conn = sqlite3.connect(DB_FILE)
     conn.executemany(
-        "INSERT INTO transactions(date,type,amount,category,comment) VALUES (?,?,?,?,?)",
+        "INSERT INTO transactions(date,type,amount,category,comment,primary_flag)"
+        " VALUES (?,?,?,?,?,?)",
         [(d, *r) for r in rows],
     )
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
+
 
 # 5. PARSER --------------------------------------------------------------------
 MONTHS_RU = {"января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,"июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12}
@@ -121,26 +134,30 @@ def parse_transaction(txt: str):
 
         # ---------- ДОХОД ----------
         if (m := INCOME_RE.match(ln)):
-            res.append(("income",
-                        _normalize(m.group(1)),
-                        None,
-                        m.group(2).strip()))
+            res.append((
+                "income",
+                _normalize(m.group(1)),
+                None,
+                m.group(2).strip(),
+                1                      # <‑‑ добавляем primary_flag = 1
+            ))
             continue
 
         # ---------- РАСХОД ----------
         if (m := EXPENSE_RE.match(ln)):
-            amt = _normalize(m.group(1))          # положительное!
+            amt     = _normalize(m.group(1))          # положительное!
             comment = m.group(2).strip()
-            cats = re.findall(r"\[([^\]]+)\]", ln) or ["другое"]
+            cats    = re.findall(r"\[([^\]]+)\]", ln) or ["другое"]
 
             for idx, cat in enumerate(cats):
                 cat = cat.strip().lower()
                 if cat not in VALID_CATEGORIES:
                     cat = "другое"
 
-                amt_store = amt if idx == 0 else 0   # сумму пишем ТОЛЬКО один раз
-                res.append(("expense", amt_store, cat, comment))
+                is_primary = 1 if idx == 0 else 0     # ← для общего расхода
+                res.append(("expense", amt, cat, comment, is_primary))
             continue
+
 
         # если строка не распознана — логируем для отладки
         logging.info("UNPARSED | %s | %s", d.isoformat(), ln[:80])
@@ -155,26 +172,56 @@ def _bounds(y,m):
     return st, date(ey,em,1)
 
 
-def get_summary(y,m):
-    st,en=_bounds(y,m)
-    conn=sqlite3.connect(DB_FILE); c=conn.cursor()
-    c.execute("SELECT SUM(amount) FROM transactions WHERE type='income' AND date>=? AND date<?",(st,en)); inc=(c.fetchone()[0] or 0)/100
-    c.execute("SELECT SUM(amount) FROM transactions WHERE type='expense' AND date>=? AND date<?",(st,en)); exp=(c.fetchone()[0] or 0)/100
-    bal=inc-exp
-    c.execute("""SELECT category,SUM(amount) FROM transactions WHERE type='expense' AND date>=? AND date<? GROUP BY category ORDER BY SUM(amount) DESC""",(st,en))
-    cats=[(ct,-am/100) for ct,am in c.fetchall()]
-    conn.close(); return inc,exp,bal,cats
+def get_summary(y: int, m: int):
+    """Возвращает inc, exp, cats   (3 значения)"""
+    st, en = _bounds(y, m)
+    conn   = sqlite3.connect(DB_FILE)
+    c      = conn.cursor()
+
+    # ДОХОД
+    c.execute("SELECT SUM(amount) FROM transactions "
+              "WHERE type='income' AND date>=? AND date<?", (st, en))
+    inc = (c.fetchone()[0] or 0) / 100
+
+    # РАСХОД (только primary_flag = 1)
+    c.execute("SELECT SUM(amount) FROM transactions "
+              "WHERE type='expense' AND primary_flag=1 "
+              "AND date>=? AND date<?", (st, en))
+    exp = (c.fetchone()[0] or 0) / 100
+
+    # КАТЕГОРИИ — сумма ВСЕХ строк, без фильтра primary_flag
+    c.execute("SELECT category, SUM(amount) "
+              "FROM transactions "
+              "WHERE type='expense' AND date>=? AND date<? "
+              "GROUP BY category", (st, en))
+    cats = [(cat, -amt / 100) for cat, amt in c.fetchall()]
+
+    conn.close()
+    return inc, exp, cats
 
 
-def get_daily(y,m):
-    st,en=_bounds(y,m)
-    conn=sqlite3.connect(DB_FILE); c=conn.cursor()
+
+def get_daily(y: int, m: int):
+    st, en = _bounds(y, m)
+    conn   = sqlite3.connect(DB_FILE)
+    c      = conn.cursor()
+
     c.execute("""
         SELECT date,
-               SUM(CASE WHEN type='income'  THEN amount ELSE 0 END)/100 AS inc,
-               SUM(CASE WHEN type='expense' THEN -amount ELSE 0 END)/100 AS exp
-        FROM transactions WHERE date>=? AND date<? GROUP BY date ORDER BY date""",(st,en))
-    rows=c.fetchall(); conn.close(); return rows
+               SUM(CASE WHEN type='income'
+                        THEN  amount                       ELSE 0 END)/100  AS inc,
+               SUM(CASE WHEN type='expense' AND primary_flag = 1
+                        THEN -amount                       ELSE 0 END)/100  AS exp
+        FROM transactions
+        WHERE date >= ? AND date < ?
+        GROUP BY date
+        ORDER BY date
+    """, (st, en))
+
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 
 # 7. HANDLERS -----------------------------------------------------------------
 @bot.message_handler(commands=['start','help'])
@@ -185,18 +232,27 @@ def _help(msg):
 
 @bot.message_handler(commands=['summary'])
 def _summary(msg):
-    try: _,mm=msg.text.split(); mm=int(mm)
-    except: bot.reply_to(msg,'/summary <месяц>'); return
-    y=datetime.now().year; inc,exp,bal,cats=get_summary(y,mm)
-    if not (inc or exp): bot.reply_to(msg,'Нет данных'); return
-    name = [k for k, v in MONTHS_RU.items() if v == mm][0] 
-    out = [f'<b>Отчёт за {name} {y}</b>',
-           f'Доход:  <b>{inc:,.0f}</b>р',
-           f'Расход: <b>{exp:,.0f}</b>р',
-           f'Итог:   <b>{bal:,.0f}</b>р',
-           '<b>Расходы по категориям:</b>']
+    try:
+        _, mm = msg.text.split(); mm = int(mm)
+    except ValueError:
+        bot.reply_to(msg, '/summary <месяц>'); return
+
+    # get_summary возвращает 3 значения — inc, exp, cats
+    inc, exp, cats = get_summary(datetime.now().year, mm)
+    bal = inc - exp
+
+    if not (inc or exp):
+        bot.reply_to(msg, 'Нет данных'); return
+
+    name = [k for k, v in MONTHS_RU.items() if v == mm][0]
+    out  = [f'<b>Отчёт за {name} {datetime.now().year}</b>',
+            f'Доход:  <b>{inc:,.0f}</b>р',
+            f'Расход: <b>{exp:,.0f}</b>р',
+            f'Итог:   <b>{bal:,.0f}</b>р',
+            '<b>Расходы по категориям:</b>']
     out += [f'{c}: <b>{a:,.0f}</b>р' for c, a in cats]
     bot.reply_to(msg, '\n'.join(out))
+
 
 @bot.message_handler(commands=['daily'])
 def _daily(msg):
