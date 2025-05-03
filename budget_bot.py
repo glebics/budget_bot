@@ -293,25 +293,29 @@ def _summary(msg):
     if not (inc or exp):
         bot.reply_to(msg, 'Нет данных'); return
 
+    name = [k for k, v in MONTHS_RU.items() if v == mm][0]
+
     # Показываем суммы по дням
     daily_rows = get_daily(y, mm)
     daily_text = render_daily(daily_rows)
     daily_msg = bot.reply_to(msg, daily_text)
 
-    # Показываем итоговый отчёт
-    name = [k for k, v in MONTHS_RU.items() if v == mm][0]
-    summary_text = render_summary(name, y, inc, exp, bal, cats)
-    summary_msg = bot.reply_to(msg, summary_text)
+    # Показываем итог
+    summary_msg = bot.reply_to(msg, render_summary(name, y, inc, exp, bal, cats))
+    daily_id = daily_msg.message_id
+    summary_id = summary_msg.message_id
 
-    # Удалим только команду /summary и временные сообщения о транзакциях
+    # --- очистка ---
     to_delete = GC_BUFFER.copy()
-    to_delete.append(msg.id)  # команду тоже удалить
+    to_delete.append(msg.id)  # удалить только команду /summary
+
     for mid in to_delete:
         try:
             bot.delete_message(msg.chat.id, mid)
         except:
-            pass  # может быть устарело
+            pass
     GC_BUFFER.clear()
+
 
 
 
@@ -336,6 +340,9 @@ def _daily(msg):
 
 @bot.message_handler(content_types=['text', 'photo'])
 def _incoming(msg):
+    # ⬅️ Всегда добавляем исходное сообщение (и текст, и фото)
+    GC_BUFFER.append(msg.message_id)
+
     text = msg.text or msg.caption or ''
     d, rows = parse_transaction(text)
     if not rows:
@@ -343,9 +350,8 @@ def _incoming(msg):
 
     add_transactions(d, rows)
     bot_msg = bot.reply_to(msg, f'Записал {len(rows)} транзакций на {d.strftime("%d.%m.%Y")}')
-    
-    # Сохраняем и ID пользователя, и ID ответа бота
-    GC_BUFFER.extend([msg.id, bot_msg.id])
+    GC_BUFFER.append(bot_msg.message_id)
+
 
 
 # 8. MAIN LOOP ---------------------------------------------------------------
