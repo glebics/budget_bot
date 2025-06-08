@@ -183,16 +183,17 @@ def parse_transaction(txt: str):
 
 
 # 6. REPORTS -------------------------------------------------------------------
-def _bounds(y,m):
-    st=date(y,m,1); ey,em=(y+1,1) if m==12 else (y,m+1)
-    return st, date(ey,em,1)
+def _bounds(y, m):
+    st = date(y, m, 1)
+    ey, em = (y + 1, 1) if m == 12 else (y, m + 1)
+    return st, date(ey, em, 1)
 
 
 def get_summary(y: int, m: int):
-    """Возвращает inc, exp, cats   (3 значения)"""
+    """Возвращает inc, exp, cats, transactions   (4 значения)"""
     st, en = _bounds(y, m)
-    conn   = sqlite3.connect(DB_FILE)
-    c      = conn.cursor()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
 
     # ДОХОД
     c.execute("SELECT SUM(amount) FROM transactions "
@@ -212,14 +213,26 @@ def get_summary(y: int, m: int):
               "GROUP BY category", (st, en))
     cats = [(cat, -amt / 100) for cat, amt in c.fetchall()]
 
+    # ПОЛНЫЙ СПИСОК ТРАНЗАКЦИЙ ПО КАТЕГОРИЯМ
+    c.execute("""
+        SELECT category, date, amount, comment
+        FROM transactions
+        WHERE type='expense' AND date>=? AND date<? 
+        ORDER BY date
+    """, (st, en))
+    transactions = {}
+    for cat, d, amt, comment in c.fetchall():
+        amt = -amt / 100  # Инвертируем для отрицательного значения
+        transactions.setdefault(cat, []).append((d, amt, comment))
+
     conn.close()
-    return inc, exp, cats
+    return inc, exp, cats, transactions
 
 
 def get_daily(y: int, m: int):
     st, en = _bounds(y, m)
-    conn   = sqlite3.connect(DB_FILE)
-    c      = conn.cursor()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
 
     c.execute("""
         SELECT date,
@@ -240,7 +253,7 @@ def pretty_money(v: float) -> str:
     return f'{v:,.0f}р'.replace(',', ' ')        # узкий не‑перенос пробел
 
 
-def render_summary(month_name: str, y: int, inc: float, exp: float, bal: float, cats: list[tuple[str, float]]) -> str:
+def render_summary(month_name: str, y: int, m: int, inc: float, exp: float, bal: float, cats: list[tuple[str, float]], transactions: dict) -> tuple[str, InlineKeyboardMarkup]:
     emoji = {'доход': '💰', 'расход': '💸', 'итог': '🟢' if bal >= 0 else '🔴'}
     cat_emoji = {
         'еда': '🍲', 'сладкое': '🍭', 'другое': '📦', 'нужное': '🛠️',
@@ -255,20 +268,35 @@ def render_summary(month_name: str, y: int, inc: float, exp: float, bal: float, 
         '',
         '📂 <b>Расходы по категориям</b>',
     ]
+    kb = InlineKeyboardMarkup()
     for cat, val in cats:
         ico = cat_emoji.get(cat, '•')
-        lines.append(f'{ico} <b>{cat}:</b> {pretty_money(val)}')
-    return '\n'.join(lines)
+        lines.append(f'{ico} <blockquote><b>{cat}:</b> {pretty_money(val)}</blockquote>')
+        kb.add(InlineKeyboardButton(f"Подробности {cat}", callback_data=f"details:{y}:{m}:{cat}"))
 
+    return '\n'.join(lines), kb
 
 
 def render_daily(rows):
     out = ['🗓️ <b>Сводка по дням</b>']
     for d, inc, exp in rows:
         date_s = datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m')
-        bal    = inc - exp  # Баланс = доходы - расходы
+        bal = inc - exp
         out.append(f'{date_s}: +{pretty_money(inc)} / -{pretty_money(exp)} ⇒ {pretty_money(bal)}')
     return '\n'.join(out)
+
+
+def render_details(category: str, transactions: dict, y: int, m: int):
+    lines = [f'📋 <b>Подробности по категории "{category}" за {MONTHS_NOM[m]} {y}</b>']
+    if category in transactions:
+        for d, amt, comment in transactions[category]:
+            date_s = datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m')
+            lines.append(f'{date_s}: {pretty_money(amt)} — {comment}')
+    else:
+        lines.append("Нет транзакций для этой категории.")
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Назад к категориям", callback_data=f"back:{y}:{m}"))
+    return '\n'.join(lines), kb
 
 
 # 7. HANDLERS -----------------------------------------------------------------
@@ -295,16 +323,34 @@ def pick_summary(call):
     _, y, m = call.data.split(":")
     y, m = int(y), int(m)
 
-    inc, exp, cats = get_summary(y, m)
+    inc, exp, cats, transactions = get_summary(y, m)
     bal = inc - exp
 
     daily_rows = get_daily(y, m)
 
     daily_txt = render_daily(daily_rows)
-    summary_txt = render_summary(MONTHS_NOM[m], y, inc, exp, bal, cats)
+    summary_txt, kb = render_summary(MONTHS_NOM[m], y, m, inc, exp, bal, cats, transactions)
 
     bot.send_message(call.message.chat.id, daily_txt)
-    bot.send_message(call.message.chat.id, summary_txt)
+    msg = bot.send_message(call.message.chat.id, summary_txt, reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("details:"))
+def show_details(call):
+    _, y, m, category = call.data.split(":")
+    y, m = int(y), int(m)
+    inc, exp, cats, transactions = get_summary(y, m)
+    details_txt, kb = render_details(category, transactions, y, m)
+    bot.edit_message_text(details_txt, call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("back:"))
+def go_back(call):
+    y, m = map(int, call.data.split(":")[1:])
+    inc, exp, cats, transactions = get_summary(y, m)
+    bal = inc - exp
+    summary_txt, kb = render_summary(MONTHS_NOM[m], y, m, inc, exp, bal, cats, transactions)
+    bot.edit_message_text(summary_txt, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
 
 # сохраним id всех входящих msg и id ответов бота
@@ -326,7 +372,7 @@ def _summary(msg):
         bot.reply_to(msg, '/summary <месяц>'); return
 
     y = datetime.now().year
-    inc, exp, cats = get_summary(y, mm)
+    inc, exp, cats, transactions = get_summary(y, mm)
     bal = inc - exp
 
     if not (inc or exp):
@@ -340,7 +386,8 @@ def _summary(msg):
     daily_msg = bot.reply_to(msg, daily_text)
 
     # Показываем итог
-    summary_msg = bot.reply_to(msg, render_summary(name, y, inc, exp, bal, cats))
+    summary_txt, kb = render_summary(name, y, mm, inc, exp, bal, cats, transactions)
+    summary_msg = bot.reply_to(msg, summary_txt, reply_markup=kb)
     daily_id = daily_msg.message_id
     summary_id = summary_msg.message_id
 
