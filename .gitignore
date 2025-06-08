@@ -5,3 +5,5 @@ __pycache__/
 budget_logs.txt
 .DS_Store
 /venv
+unparsed.log
+april_logs.txt

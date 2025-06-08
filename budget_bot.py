@@ -9,7 +9,8 @@ from datetime import datetime, date
 
 from dotenv import load_dotenv
 import telebot
-from telebot import types
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 
 # 1. CONFIG --------------------------------------------------------------------
 load_dotenv()
@@ -83,6 +84,11 @@ def add_transactions(d: date, rows: list[tuple]):
 
 # 5. PARSER --------------------------------------------------------------------
 MONTHS_RU = {"января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,"июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12}
+MONTHS_NOM = {
+    1: "январь",  2: "февраль", 3: "март",     4: "апрель",
+    5: "май",     6: "июнь",    7: "июль",     8: "август",
+    9: "сентябрь",10: "октябрь",11: "ноябрь", 12: "декабрь"
+}
 MINUS_CHARS = r"\-−–—"
 INCOME_RE  = re.compile(rf"^\s*\+\s*([\d\s\u00A0\u202F.,]+)р?\s*(.*)$", re.I)
 EXPENSE_RE = re.compile(rf"^\s*[{MINUS_CHARS}]\s*([\d\s\u00A0\u202F.,]+)р?\s*(.*)$", re.I)
@@ -236,26 +242,26 @@ def pretty_money(v: float) -> str:
     return f'{v:,.0f}р'.replace(',', ' ')        # узкий не‑перенос пробел
 
 
-def render_summary(month_name: str, y: int,
-                   inc: float, exp: float, bal: float,
-                   cats: list[tuple[str, float]]) -> str:
+def render_summary(month_name: str, y: int, inc: float, exp: float, bal: float, cats: list[tuple[str, float]]) -> str:
     emoji = {'доход': '💰', 'расход': '💸', 'итог': '🟢' if bal >= 0 else '🔴'}
     cat_emoji = {
-        'еда':'🍲', 'сладкое':'🍭', 'другое':'📦', 'нужное':'🛠️',
-        'жилье':'🏠', 'лекарства':'💊', 'проезд':'🚌', 'даня':'🧒',
+        'еда': '🍲', 'сладкое': '🍭', 'другое': '📦', 'нужное': '🛠️',
+        'жилье': '🏠', 'лекарства': '💊', 'проезд': '🚌', 'даня': '🧒'
     }
+
     lines = [
-        f"📊 <b>Отчёт за {month_name} {y}</b>",
-        f"{emoji['доход']} Доход:  <b>{pretty_money(inc)}</b>",
-        f"{emoji['расход']} Расход: <b>{pretty_money(exp)}</b>",
-        f"{emoji['итог']} Итог:   <b>{pretty_money(bal)}</b>",
+        '📊 <b>Отчёт за {}</b>\n'.format(month_name.capitalize() + f' {y}'),
+        f'{emoji["доход"]} <b>Доход:</b>  <b>{pretty_money(inc)}</b>',
+        f'{emoji["расход"]} <b>Расход:</b> <b>{pretty_money(exp)}</b>',
+        f'{emoji["итог"]} <b>Итог:</b>   <b>{pretty_money(bal)}</b>',
         '',
         '📂 <b>Расходы по категориям</b>',
     ]
     for cat, val in cats:
         ico = cat_emoji.get(cat, '•')
-        lines.append(f'{ico} {cat}: <b>{pretty_money(val)}</b>')
+        lines.append(f'{ico} <b>{cat}:</b> {pretty_money(val)}')
     return '\n'.join(lines)
+
 
 
 def render_daily(rows):
@@ -268,6 +274,40 @@ def render_daily(rows):
 
 
 # 7. HANDLERS -----------------------------------------------------------------
+@bot.message_handler(commands=['menu'])
+def send_menu(msg):
+    kb = InlineKeyboardMarkup()
+    y = datetime.now().year
+    for yy in range(y, y - 4, -1):
+        kb.add(InlineKeyboardButton(str(yy), callback_data=f"year:{yy}"))
+    bot.send_message(msg.chat.id, "Выбери год", reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("year:"))
+def pick_year(call):
+    y = int(call.data.split(":")[1])
+    kb = InlineKeyboardMarkup()
+    for i in range(1, 13):
+        kb.add(InlineKeyboardButton(MONTHS_NOM[i], callback_data=f"summary:{y}:{i}"))
+    bot.edit_message_text(f"Год {y}. Теперь выбери месяц:", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("summary:"))
+def pick_summary(call):
+    _, y, m = call.data.split(":")
+    y, m = int(y), int(m)
+
+    inc, exp, cats = get_summary(y, m)
+    bal = inc - exp
+    daily_rows = get_daily(y, m)
+
+    daily_txt = render_daily(daily_rows)
+    summary_txt = render_summary(MONTHS_NOM[m], y, inc, exp, bal, cats)
+
+    bot.send_message(call.message.chat.id, daily_txt)
+    bot.send_message(call.message.chat.id, summary_txt)
+
+
 # сохраним id всех входящих msg и id ответов бота
 GC_BUFFER = []
 
@@ -315,8 +355,6 @@ def _summary(msg):
         except:
             pass
     GC_BUFFER.clear()
-
-
 
 
 @bot.message_handler(commands=['daily'])
