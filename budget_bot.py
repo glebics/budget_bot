@@ -223,10 +223,8 @@ def get_daily(y: int, m: int):
 
     c.execute("""
         SELECT date,
-               SUM(CASE WHEN type='income'
-                        THEN  amount                       ELSE 0 END)/100  AS inc,
-               SUM(CASE WHEN type='expense' AND primary_flag = 1
-                        THEN -amount                       ELSE 0 END)/100  AS exp
+               SUM(CASE WHEN type='income' THEN amount ELSE 0 END)/100  AS inc,
+               SUM(CASE WHEN type='expense' AND primary_flag = 1 THEN amount ELSE 0 END)/100  AS exp
         FROM transactions
         WHERE date >= ? AND date < ?
         GROUP BY date
@@ -268,8 +266,8 @@ def render_daily(rows):
     out = ['🗓️ <b>Сводка по дням</b>']
     for d, inc, exp in rows:
         date_s = datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m')
-        bal    = inc - exp
-        out.append(f'{date_s}: +{inc:,.0f} / -{exp:,.0f} ⇒ {bal:,.0f}')
+        bal    = inc - exp  # Баланс = доходы - расходы
+        out.append(f'{date_s}: +{pretty_money(inc)} / -{pretty_money(exp)} ⇒ {pretty_money(bal)}')
     return '\n'.join(out)
 
 
@@ -299,6 +297,7 @@ def pick_summary(call):
 
     inc, exp, cats = get_summary(y, m)
     bal = inc - exp
+
     daily_rows = get_daily(y, m)
 
     daily_txt = render_daily(daily_rows)
@@ -372,7 +371,7 @@ def _daily(msg):
     for d, inc, exp in rows:
         d_fmt = datetime.strptime(d, '%Y-%m-%d').strftime('%d.%m')
         bal = inc - exp
-        out.append(f'{d_fmt}: +{inc:,.0f}р / -{exp:,.0f}р ⇒ {bal:,.0f}р')
+        out.append(f'{d_fmt}: +{pretty_money(inc)}р / -{pretty_money(exp)}р ⇒ {pretty_money(bal)}р')
     bot.reply_to(msg, ''.join(out))
 
 
@@ -402,4 +401,3 @@ if __name__ == '__main__':
         except Exception as e:
             logging.error('Polling crash: %s', e, exc_info=True)
             continue
-
