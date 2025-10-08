@@ -18,7 +18,9 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
     raise RuntimeError("В .env нет TELEGRAM_TOKEN")
 DB_FILE = "budget.db"
-VALID_CATEGORIES = {c.strip().lower() for c in os.getenv("VALID_CATEGORIES", "").split(",") if c.strip()} or {"другое"}
+
+# LEGACY: больше не используется для фильтрации — категории считаются динамически
+VALID_CATEGORIES = {c.strip().lower() for c in os.getenv("VALID_CATEGORIES", "").split(",") if c.strip()}
 
 
 # 2. LOGGING -------------------------------------------------------------------
@@ -163,13 +165,11 @@ def parse_transaction(txt: str):
             cats    = re.findall(r"\[([^\]]+)\]", ln) or ["другое"]
 
             for idx, cat in enumerate(cats):
-                cat = cat.strip().lower()
-                if cat not in VALID_CATEGORIES:
-                    cat = "другое"
-
-                is_primary = 1 if idx == 0 else 0     # ← для общего расхода
+                cat = cat.strip().lower()             # нормализуем, но не фильтруем
+                is_primary = 1 if idx == 0 else 0     # ← общий расход по первой категории
                 res.append(("expense", amt, cat, comment, is_primary))
             continue
+
         # если строка не распознана — логируем отдельно
         log_unparsed.info("UNPARSED | %s | %s", d.isoformat(), ln[:80])
 
@@ -207,11 +207,14 @@ def get_summary(y: int, m: int):
     exp = (c.fetchone()[0] or 0) / 100
 
     # КАТЕГОРИИ — сумма ВСЕХ строк, без фильтра primary_flag
+    # КАТЕГОРИИ — сумма ВСЕХ строк, без фильтра primary_flag
     c.execute("SELECT category, SUM(amount) "
-              "FROM transactions "
-              "WHERE type='expense' AND date>=? AND date<? "
-              "GROUP BY category", (st, en))
+            "FROM transactions "
+            "WHERE type='expense' AND date>=? AND date<? "
+            "GROUP BY category "
+            "ORDER BY SUM(amount) DESC", (st, en))
     cats = [(cat, -amt / 100) for cat, amt in c.fetchall()]
+
 
     # ПОЛНЫЙ СПИСОК ТРАНЗАКЦИЙ ПО КАТЕГОРИЯМ
     c.execute("""
@@ -260,21 +263,27 @@ def render_summary(month_name: str, y: int, m: int, inc: float, exp: float, bal:
         'жилье': '🏠', 'лекарства': '💊', 'проезд': '🚌', 'даня': '🧒'
     }
 
-    lines = [
-        '📊 <b>Отчёт за {}</b>\n'.format(month_name.capitalize() + f' {y}'),
-        f'{emoji["доход"]} <b>Доход:</b>  <b>{pretty_money(inc)}</b>',
-        f'{emoji["расход"]} <b>Расход:</b> <b>{pretty_money(exp)}</b>',
-        f'{emoji["итог"]} <b>Итог:</b>   <b>{pretty_money(bal)}</b>',
+    lines: list[str] = [
+        f'📊 <b>Отчёт за {month_name.capitalize()} {y}</b>',
         '',
         '📂 <b>Расходы по категориям</b>',
     ]
+
     kb = InlineKeyboardMarkup()
     for cat, val in cats:
-        ico = cat_emoji.get(cat, '•')
-        lines.append(f'{ico} <blockquote><b>{cat}:</b> {pretty_money(val)}</blockquote>')
+        ico = cat_emoji.get(cat, '🏷️')
+        # эмодзи + категория + сумма — в одной строке
+        lines.append(f'{ico} <b>{cat}:</b> {pretty_money(val)}')
         kb.add(InlineKeyboardButton(f"Подробности {cat}", callback_data=f"details:{y}:{m}:{cat}"))
 
+    # сводка (Доход/Расход/Итог) внизу
+    lines.append('')
+    lines.append(f'{emoji["доход"]} <b>Доход:</b>  <b>{pretty_money(inc)}</b>')
+    lines.append(f'{emoji["расход"]} <b>Расход:</b> <b>{pretty_money(exp)}</b>')
+    lines.append(f'{emoji["итог"]} <b>Итог:</b>   <b>{pretty_money(bal)}</b>')
+
     return '\n'.join(lines), kb
+
 
 
 def render_daily(rows):
